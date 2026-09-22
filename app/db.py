@@ -35,7 +35,25 @@ CREATE TABLE IF NOT EXISTS components (
     PRIMARY KEY (container_id, source_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_components_source ON components(source_id);
+-- 反向追踪查询（GET /sources/{sample_id}/containers）的支撑索引：
+-- 按祖先来源取其全部份额行，并在索引内按 container_id 有序，直接服务于
+-- “按 container_id 字典序 + cursor 翻页”。复合索引的最左前缀同时覆盖旧的
+-- source_id 单列查询，故旧索引在迁移时删除。
+DROP INDEX IF EXISTS idx_components_source;
+CREATE INDEX IF NOT EXISTS idx_components_source_container
+    ON components(source_id, container_id);
+
+-- 全局转移修订号：单行表（id 恒为 1），revision 初值为 0。
+-- 每个**成功提交**的批次与容器扣减 / version 递增 / 幂等记录 / 审计记录在
+-- 同一个写事务内把 revision 原子加 1；预演、失败批次与幂等重放不递增。
+-- GET /sources/{id}/containers 的分页游标携带取页时的 revision，翻页期间
+-- 有成功批次提交（revision 变化）即返回 409 stale_cursor，保证跨页一致。
+CREATE TABLE IF NOT EXISTS transfer_revision (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 0
+);
+-- 幂等播种唯一单行：旧库升级 / 重启都不覆盖已有修订号
+INSERT OR IGNORE INTO transfer_revision (id, revision) VALUES (1, 0);
 
 -- POST /transfers/batch 的幂等记录：仅在批次成功提交时，与容器扣减/版本递增
 -- 写入同一个事务。重放（同键同请求体）直接返回 response_body，不再扣减体积。

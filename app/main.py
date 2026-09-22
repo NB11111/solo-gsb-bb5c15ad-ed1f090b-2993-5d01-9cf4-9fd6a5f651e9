@@ -24,6 +24,7 @@ from .schemas import (
     ContainerStatusOut,
     SampleIn,
     SampleOut,
+    SourceContainersOut,
 )
 
 
@@ -53,8 +54,13 @@ app = FastAPI(
         "每个成功批次在同一事务追加一条只追加审计记录（含批次摘要、受影响容器、"
         "结果版本），以前一条记录的哈希形成可校验哈希链；"
         "失败 / 重放 / 预演均不产生审计记录。"
+        "另提供祖先来源反向追踪 GET /sources/{sample_id}/containers："
+        "按当前组件表找出所有仍含该初始样品非零份额的容器（容器体积、该来源"
+        "绝对份额及占比），支持 min_amount 过滤与按 container_id 字典序的 cursor "
+        "稳定分页；游标携带全局 transfer_revision，每个成功批次原子递增该修订号"
+        "（预演 / 失败 / 幂等重放不递增），翻页期间修订号变化返回 stale_cursor。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -212,6 +218,31 @@ def container_status(
     container_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     return service.get_container_status(conn, container_id)
+
+
+@app.get(
+    "/sources/{sample_id}/containers",
+    response_model=SourceContainersOut,
+    tags=["query"],
+    summary="反向追踪仍含某初始样品非零份额的全部容器（cursor 稳定分页）",
+)
+def source_containers(
+    sample_id: str,
+    min_amount: str | None = None,
+    limit: int = service.SOURCES_DEFAULT_LIMIT,
+    cursor: str | None = None,
+    conn: sqlite3.Connection = Depends(get_db),
+) -> dict:
+    # min_amount 以字符串接收交由 service 用 Decimal 解析（拒绝非法值 422，
+    # 避免 FastAPI 默认 422 的错误结构与 {error:{code,...}} 不一致）；
+    # limit 由 service 统一校验 1..100，cursor 为不透明 base64 字符串。
+    return service.get_source_containers(
+        conn,
+        sample_id.strip(),
+        min_amount_raw=min_amount,
+        limit=limit,
+        cursor=cursor,
+    )
 
 
 # --------------------------------------------------------------------------- #

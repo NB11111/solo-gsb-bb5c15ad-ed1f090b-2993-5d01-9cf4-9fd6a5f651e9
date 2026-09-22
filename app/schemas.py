@@ -290,6 +290,54 @@ class AuditBreakInfo(BaseModel):
     detail: str = Field(..., description="断裂的人类可读说明")
 
 
+# --------------------------------------------------------------------------- #
+# 祖先来源反向追踪（GET /sources/{sample_id}/containers）
+# --------------------------------------------------------------------------- #
+class SourceContainerOut(BaseModel):
+    """仍持有指定初始样品非零份额的单个容器。"""
+
+    container_id: str
+    volume: DecimalStr = Field(..., description="容器当前体积（全部祖先份额之和）")
+    source_amount: DecimalStr = Field(
+        ..., description="该来源（被追踪初始样品）在容器中的绝对体积份额（> 0）"
+    )
+    proportion: DecimalStr = Field(
+        ...,
+        description=(
+            "该来源份额占容器当前体积的比例（source_amount / volume），"
+            "按 PROPORTION_SCALE 四舍五入，仅用于展示；精确核对请用 source_amount"
+        ),
+    )
+
+
+class SourceContainersOut(BaseModel):
+    sample_id: str = Field(..., description="被追踪的初始样品 ID")
+    transfer_revision: int = Field(
+        ...,
+        description=(
+            "全局转移修订号：每个成功批次原子 +1（预演 / 失败 / 幂等重放不递增）。"
+            "next_cursor 内嵌本字段；翻页时若与当前修订号不一致则返回 409 stale_cursor"
+        ),
+    )
+    limit: int = Field(..., description="本页生效的页大小（1..100，默认 100）")
+    min_amount: DecimalStr | None = Field(
+        ..., description="生效的最小绝对份额过滤；未提供时为 null"
+    )
+    count: int = Field(..., description="本页实际返回的容器数")
+    next_cursor: str | None = Field(
+        ...,
+        description=(
+            "下一页不透明游标（携带 transfer_revision 与本页末 container_id）；"
+            "已到末页时为 null。游标损坏返回 400 invalid_cursor，"
+            "修订号变化返回 409 stale_cursor"
+        ),
+    )
+    containers: list[SourceContainerOut] = Field(
+        ...,
+        description="仍含该初始样品非零份额的容器，按 container_id 字典序分页",
+    )
+
+
 class AuditVerifyOut(BaseModel):
     valid: bool = Field(..., description="整条审计链是否完整可校验")
     records: int = Field(..., description="审计记录总数")

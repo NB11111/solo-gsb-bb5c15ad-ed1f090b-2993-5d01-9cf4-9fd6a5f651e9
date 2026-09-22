@@ -33,6 +33,9 @@ def _clean_tables():
         conn.execute("DELETE FROM containers")
         conn.execute("DELETE FROM idempotency_keys")
         conn.execute("DELETE FROM compatibility_rules")
+        # 全局转移修订号复位为 0（单行表，DELETE/INSERT 即可重建）
+        conn.execute("DELETE FROM transfer_revision")
+        conn.execute("INSERT INTO transfer_revision (id, revision) VALUES (1, 0)")
         yield
     finally:
         conn.close()
