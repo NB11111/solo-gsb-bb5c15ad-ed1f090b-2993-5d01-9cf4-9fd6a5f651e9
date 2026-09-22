@@ -43,9 +43,21 @@
   与提交后来源构成、结果版本，并把前一条记录的哈希纳入当前记录的 entry_hash，
   形成可校验哈希链。审计记录由数据库触发器禁止 UPDATE/DELETE；失败批次、
   幂等重放与预演均不产生审计记录。
+* 全局单行表 ``transfer_revision`` 记录**转移修订号**（初始 0）：每个成功批次
+  在其写事务内（与扣减 / version 递增 / 审计行同一事务）原子 +1，一批多条转移
+  也只加 1；预演、失败批次与幂等重放不递增，登记 / 容量 / 规则接口亦不触碰。
+  :func:`list_source_containers` 的分页游标携带查询时刻的修订号，翻页期间号变化
+  即抛 409 stale_cursor。
+* :func:`list_source_containers` 提供**祖先来源反向追踪**
+  （``GET /sources/{sample_id}/containers``）：在只读连接的只读事务（一致性快照）
+  内按 ``components`` 表找出仍含某初始样品非零份额的全部容器，返回容器体积、
+  该来源绝对份额与占比；支持 ``min_amount`` 过滤与按 container_id 字典序的
+  limit / cursor 键集分页（limit ∈ [1, 100]），游标为不透明 base64 JSON，
+  损坏 / 跨样品 / 过滤条件不一致返回 4xx，样品未登记为初始样品返回 404。
 """
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import sqlite3
@@ -86,8 +98,17 @@ class LineageError(Exception):
 # --------------------------------------------------------------------------- #
 # Decimal 辅助
 # --------------------------------------------------------------------------- #
-def parse_volume(raw: Decimal, field: str) -> Decimal:
-    """校验入参体积：有限、非负、且不超过配置精度。"""
+def parse_volume(raw: Decimal | str, field: str) -> Decimal:
+    """校验入参体积：有限、非负、且不超过配置精度。
+
+    接受 :class:`~decimal.Decimal` 或可被 Decimal 解析的字符串
+    （API 层一般已先解析为 Decimal）。
+    """
+    if not isinstance(raw, Decimal):
+        try:
+            raw = Decimal(raw)
+        except Exception:
+            raise LineageError(422, "invalid_volume", f"{field} 必须是有限数")
     if not raw.is_finite():
         raise LineageError(422, "invalid_volume", f"{field} 必须是有限数")
     if raw < 0:
@@ -673,6 +694,11 @@ def _commit_batch(
         next_versions = {cid: ver + 1 for cid, ver in current_versions.items()}
         _persist_states(conn, touched, next_versions)
 
+        # 全局转移修订号与容器扣减、version 递增同一事务原子 +1：
+        # 提交前其他连接读到的仍是旧号；事务回滚（失败）时递增一并回滚。
+        # 预演不进入本函数；幂等重放在上方提前 ROLLBACK 返回，亦不到此处。
+        conn.execute("UPDATE transfer_revision SET revision = revision + 1 WHERE id = 1")
+
         # 审计记录与容器扣减、version 递增、幂等行写入同一事务：
         # 之后任何异常都会连同审计行一起回滚，失败 / 预演绝不留痕。
         # 延迟导入避免 service <-> audit 导入环（audit 依赖本模块的 LineageError）。
@@ -876,3 +902,283 @@ def get_container_status(conn: sqlite3.Connection, cid: str) -> dict:
         raise LineageError(404, "unknown_container", f"容器 '{cid}' 不存在")
     state, version, capacity = loaded
     return _format_container_status(cid, state, version, capacity)
+
+
+# --------------------------------------------------------------------------- #
+# 祖先来源反向追踪：GET /sources/{sample_id}/containers
+# --------------------------------------------------------------------------- #
+# 游标（及修订号体系）的版本：结构升级时 bump，旧游标直接判无效
+CURSOR_VERSION = 1
+# 本接口页大小允许范围（与审计接口的 limit 错误码一致，取值范围独立）
+SOURCE_DEFAULT_LIMIT = 100
+SOURCE_MAX_LIMIT = 100
+
+
+def get_transfer_revision(conn: sqlite3.Connection) -> int:
+    """读取当前全局转移修订号（单行表，建库时初始化为 0）。"""
+    row = conn.execute(
+        "SELECT revision FROM transfer_revision WHERE id = 1"
+    ).fetchone()
+    return int(row["revision"]) if row is not None else 0
+
+
+def _encode_cursor(
+    *, revision: int, sample_id: str, last_container_id: str, min_amount: Decimal
+) -> str:
+    """把分页位置编码为不透明游标字符串（base64url JSON，无填充）。
+
+    游标携带全局 ``transfer_revision``（跨页一致性）、所属样品 ID（禁止跨
+    样品复用）、本页最后一个容器 ID（字典序键集分页位置）与请求时的
+    ``min_amount``（游标只对同一过滤条件有效）。
+    """
+    payload = {
+        "v": CURSOR_VERSION,
+        "rev": revision,
+        "sample": sample_id,
+        "after": last_container_id,
+        "min_amount": format(min_amount, "f"),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict:
+    """解码并校验游标结构；任何损坏 / 缺字段 / 类型不符都抛 400 invalid_cursor。"""
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii")).decode("utf-8")
+        payload = json.loads(raw)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise LineageError(
+            400, "invalid_cursor", "cursor 不是合法的分页游标（无法解码）"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise LineageError(400, "invalid_cursor", "cursor 载荷结构非法")
+    if payload.get("v") != CURSOR_VERSION:
+        raise LineageError(
+            400, "invalid_cursor", "cursor 版本不受支持（可能来自更新或更旧的服务）"
+        )
+    rev = payload.get("rev")
+    after = payload.get("after")
+    sample = payload.get("sample")
+    cursor_min = payload.get("min_amount")
+    if (
+        not isinstance(rev, int)
+        or isinstance(rev, bool)
+        or rev < 0
+        or not isinstance(after, str)
+        or not after
+        or not isinstance(sample, str)
+        or not sample
+        or not isinstance(cursor_min, str)
+    ):
+        raise LineageError(400, "invalid_cursor", "cursor 字段缺失或类型非法")
+    try:
+        cursor_min_amount = Decimal(cursor_min)
+    except Exception as exc:  # InvalidOperation 等
+        raise LineageError(400, "invalid_cursor", "cursor 中的 min_amount 非法") from exc
+    if not cursor_min_amount.is_finite() or cursor_min_amount < 0:
+        raise LineageError(400, "invalid_cursor", "cursor 中的 min_amount 非法")
+    return {
+        "revision": rev,
+        "sample_id": sample,
+        "last_container_id": after,
+        "min_amount": cursor_min_amount,
+    }
+
+
+def list_source_containers(
+    conn: sqlite3.Connection,
+    sample_id: str,
+    *,
+    min_amount: Decimal | None = None,
+    limit: int = SOURCE_DEFAULT_LIMIT,
+    cursor: str | None = None,
+) -> dict:
+    """反向追踪：按当前组件表找出所有仍含初始样品 ``sample_id`` **非零份额**
+    的容器，返回每个容器的当前体积、该来源的绝对份额与占比。
+
+    结果按 ``container_id`` 字典序键集分页（页大小 ``limit`` ∈ [1, 100]，
+    默认 100）；``min_amount``（非负、精度受 ``DECIMAL_SCALE`` 限制）只保留
+    该来源绝对份额 ≥ 阈值的容器。响应中的 ``transfer_revision`` 是读取到的
+    全局转移修订号，``next_cursor`` 在有下一页时为不透明游标字符串、否则
+    为 ``None``。
+
+    整个查询在**只读连接的只读事务**（一致性快照）内完成：
+
+    * 不携带 ``cursor``：以当前修订号建立新游标；
+    * 携带 ``cursor``：游标无法解码 / 结构非法 -> 400 ``invalid_cursor``；
+      游标属于其他样品或其 ``min_amount`` 与本次请求不一致 ->
+      400 ``cursor_parameter_mismatch``；游标修订号与当前修订号不一致
+      （翻页期间有成功批次提交）-> 409 ``stale_cursor``。
+      游标合法时沿用其修订号（在同一快照语义下取后续页），并以游标位置
+      ``after`` 之后的容器继续；
+    * ``sample_id`` 未登记为**初始样品**（未知 ID 或仅为空容器）->
+      404 ``unknown_sample``。
+    """
+    if limit < 1 or limit > SOURCE_MAX_LIMIT:
+        raise LineageError(
+            422,
+            "invalid_limit",
+            f"limit 必须在 1 到 {SOURCE_MAX_LIMIT} 之间（默认 {SOURCE_DEFAULT_LIMIT}）",
+        )
+    if min_amount is not None:
+        try:
+            threshold = parse_volume(min_amount, "min_amount")
+        except (LineageError, ArithmeticError, ValueError):
+            # 与 volume 同精度规则，但错误码语义独立（API 层一般已先行解析，
+            # 这里同时兜底内部直接调用传入非法 Decimal 的情况）
+            raise LineageError(
+                422,
+                "invalid_min_amount",
+                (
+                    "min_amount 必须是非负有限数，且小数位不能超过"
+                    f" {settings.decimal_scale} 位"
+                ),
+            )
+    else:
+        threshold = Decimal(0).quantize(VOLUME_QUANTUM)
+
+    parsed_cursor = _decode_cursor(cursor) if cursor is not None else None
+
+    # 只读事务：BEGIN 到 ROLLBACK 之间读到的是同一一致性快照
+    conn.execute("BEGIN")
+    try:
+        current_revision = get_transfer_revision(conn)
+
+        if parsed_cursor is not None:
+            if parsed_cursor["sample_id"] != sample_id:
+                raise LineageError(
+                    400,
+                    "cursor_parameter_mismatch",
+                    "cursor 属于另一个样品，不能用于本次查询",
+                )
+            if parsed_cursor["min_amount"] != threshold:
+                raise LineageError(
+                    400,
+                    "cursor_parameter_mismatch",
+                    "cursor 对应的 min_amount 与本次请求不一致，请用新条件重新开始翻页",
+                )
+            if parsed_cursor["revision"] != current_revision:
+                raise LineageError(
+                    409,
+                    "stale_cursor",
+                    (
+                        f"cursor 基于 transfer_revision={parsed_cursor['revision']}，"
+                        f"当前修订号已变为 {current_revision}（翻页期间有成功批次提交），"
+                        "请丢弃旧游标后重新查询"
+                    ),
+                    details={
+                        "cursor_revision": parsed_cursor["revision"],
+                        "current_revision": current_revision,
+                    },
+                )
+            after = parsed_cursor["last_container_id"]
+        else:
+            after = None
+
+        # 样品存在性以容器登记的 is_sample 标记为准（未知 ID / 空容器均 404）
+        sample_row = conn.execute(
+            "SELECT 1 FROM containers WHERE id = ? AND is_sample = 1", (sample_id,)
+        ).fetchone()
+        if sample_row is None:
+            raise LineageError(
+                404, "unknown_sample", f"初始样品 '{sample_id}' 不存在"
+            )
+
+        # amount 全部按 VOLUME_QUANTUM 定点存储（固定 SCALE 位小数；SCALE=0
+        # 时没有小数点）。为同时保证“精确”与“避免逐行 Decimal 解析”，在 SQL
+        # 内按 10^SCALE 缩放成整数比较 / 求和（全程整数算术，不经过 float）；
+        # Python 侧只对最终页内至多 limit 行转回 Decimal。
+        # instr 找不到 '.' 时返回 0：此时小数部分按 0 处理（纯整数字符串），
+        # CAST(x AS INTEGER) 在 SQLite 中按十进制前缀截断取整。
+        scale = settings.decimal_scale
+        factor = 10**scale
+        if scale == 0:
+            sc = "CAST(amount AS INTEGER)"
+        else:
+            sc = (
+                f"(CAST(amount AS INTEGER) * {factor}"
+                " + CASE WHEN instr(amount, '.') > 0 THEN"
+                " CAST(substr(amount, instr(amount, '.') + 1) AS INTEGER) ELSE 0 END)"
+            )
+        threshold_scaled = int(threshold.scaleb(scale))
+
+        # 覆盖索引 (source_id, container_id, amount) 支撑按 source_id 的有序
+        # 仅索引扫描；container_id > after 把键集分页位置下推到 SQL。
+        sql = (
+            "SELECT container_id, amount"
+            f" FROM components"
+            " WHERE source_id = ?"
+        )
+        sql += f" AND {sc} >= ?"
+        params: list = [sample_id, threshold_scaled]
+        if after is not None:
+            sql += " AND container_id > ?"
+            params.append(after)
+        sql += " ORDER BY container_id LIMIT ?"
+        # 多取 1 行用于判断是否还有下一页，不做 OFFSET 深翻页
+        params.append(limit + 1)
+        rows = conn.execute(sql, params).fetchall()
+        has_next = len(rows) > limit
+        page_rows = rows[:limit]
+        page_ids = [r["container_id"] for r in page_rows]
+
+        # 容器总体积逐容器点查（主键 container_id 前缀），缩放整数由 SQLite
+        # 精确 SUM（不经过 float）。现实规模下每容器祖先来源数为个位~几十，
+        # 每页至多 limit 次点查；IN 列表在大宽表上反而会触发低效全范围扫描。
+        totals_scaled: dict[str, int] = {}
+        for cid in page_ids:
+            row = conn.execute(
+                f"SELECT COALESCE(SUM({sc}), 0) AS total_scaled"
+                " FROM components WHERE container_id = ?",
+                (cid,),
+            ).fetchone()
+            totals_scaled[cid] = int(row["total_scaled"])
+
+        proportion_quantum = Decimal(1).scaleb(-settings.proportion_scale)
+        items: list[dict] = []
+        with localcontext() as ctx:
+            ctx.prec = settings.decimal_precision
+            for r in page_rows:
+                cid = r["container_id"]
+                source_amount = Decimal(r["amount"])
+                total_scaled = totals_scaled.get(cid, 0)
+                total = Decimal(total_scaled).scaleb(-scale)
+                proportion = (
+                    (source_amount / total).quantize(
+                        proportion_quantum, rounding=ROUND_HALF_UP
+                    )
+                    if total_scaled > 0
+                    else Decimal(0).quantize(proportion_quantum)
+                )
+                items.append(
+                    {
+                        "container_id": cid,
+                        "volume": format(total, "f"),
+                        "source_amount": format(source_amount, "f"),
+                        "proportion": format(proportion, "f"),
+                    }
+                )
+    finally:
+        conn.execute("ROLLBACK")
+
+    next_cursor = (
+        _encode_cursor(
+            revision=current_revision,
+            sample_id=sample_id,
+            last_container_id=page_ids[-1],
+            min_amount=threshold,
+        )
+        if has_next
+        else None
+    )
+    return {
+        "sample_id": sample_id,
+        "transfer_revision": current_revision,
+        "min_amount": format(threshold, "f"),
+        "limit": limit,
+        "count": len(items),
+        "next_cursor": next_cursor,
+        "containers": items,
+    }

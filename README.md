@@ -33,7 +33,12 @@
   摘要**纳入计算，形成可逐条校验的哈希链。审计表由数据库触发器禁止
   UPDATE/DELETE；失败批次、幂等重放与预演**绝不产生记录**。提供按容器、按序号
   范围查询审计记录与一键校验整条链完整性的 API。
-- 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**。
+- 可查询任一容器的**当前体积**以及各祖先初始样品的**来源占比**；也可以反向追踪——
+  `GET /sources/{sample_id}/containers` 按当前组件表找出**所有仍含某初始样品非零份额**
+  的容器（容器体积、该来源绝对份额与占比），支持 `min_amount` 过滤与 `limit` /
+  不透明 `cursor` **稳定分页**（按 `container_id` 字典序）。游标携带全局
+  **`transfer_revision`**：仅成功批次在其写事务内原子 +1（预演、失败、幂等重放
+  不递增），翻页期间修订号变化返回 `409 stale_cursor`；查询在**只读事务**中执行。
 
 ---
 
@@ -50,6 +55,21 @@ docker compose up --build
 - Swagger 交互文档：http://localhost:8000/docs
 - OpenAPI 描述：http://localhost:8000/openapi.json
 - 健康检查：http://localhost:8000/health
+
+快速体验祖先来源反向追踪（详见下文 [第 8 节](#8-祖先来源反向追踪仍含某初始样品的全部容器)）：
+
+```bash
+curl -X POST localhost:8000/samples -H 'Content-Type: application/json' \
+  -d '{"sample_id":"S1","volume":"100"}'
+curl -X POST localhost:8000/containers -H 'Content-Type: application/json' \
+  -d '{"container_id":"V1"}'
+curl -X POST localhost:8000/transfers/batch -H 'Content-Type: application/json' \
+  -d '{"transfers":[{"source":"S1","destination":"V1","volume":"40"}]}'
+curl 'localhost:8000/sources/S1/containers'
+# {"sample_id":"S1","transfer_revision":1,...,"containers":[
+#   {"container_id":"S1","volume":"60.000000000","source_amount":"60.000000000",...},
+#   {"container_id":"V1","volume":"40.000000000","source_amount":"40.000000000",...}]}
+```
 
 容器启动时（`docker-entrypoint.sh`）会：
 
@@ -84,7 +104,14 @@ SQLite 数据保存在 Docker 命名卷 `lineage-data`（容器内 `/data`）中
   `audit_record_containers`，并幂等安装 4 个**只追加触发器**（两表各一个
   `BEFORE UPDATE` / `BEFORE DELETE`，命中即 `RAISE`）。升级前的历史批次没有
   审计记录，审计链从升级后**第一个成功批次**开始，首条 `seq=1`、`prev_hash`
-  为 `sha256("")`。
+  为 `sha256("")`；
+- 旧库自动补出全局修订号单行表 `transfer_revision`（修订号初始为 `0`，
+  历史批次不追溯计数）；同时把 `components` 上的旧单列索引
+  `idx_components_source` 替换为两个覆盖索引
+  `idx_components_source_container(source_id, container_id, amount)`
+  （反向追踪按来源的有序仅索引扫描）与
+  `idx_components_container_source(container_id, source_id, amount)`
+  （正向查询 / 体积聚合按容器的仅索引扫描）。
 
 升级步骤（保留数据）：
 
@@ -104,8 +131,9 @@ print([r[0] for r in c.execute(\"SELECT name FROM sqlite_master WHERE type='tabl
 print([r[1] for r in c.execute('PRAGMA table_info(containers)')])
 "
 # 应包含 idempotency_keys、audit_records、audit_record_containers、
-# compatibility_rules 表，containers 列中应包含 version、capacity 与
-# is_sample；另应存在 4 个 audit_* 触发器
+# compatibility_rules、transfer_revision 表，containers 列中应包含
+# version、capacity 与 is_sample；另应存在 4 个 audit_* 触发器与
+# idx_components_source_container / idx_components_container_source 覆盖索引
 ```
 
 停止与清理：
@@ -164,6 +192,18 @@ docker compose down -v       # 同时删除数据卷
   连续递增，`prev_hash` 指向前一条记录、首条为 `sha256("")`，`entry_hash` 覆盖
   前一条哈希、序号与规范化载荷。两表均有 `BEFORE UPDATE` / `BEFORE DELETE`
   触发器，任何应用连接都无法修改或删除既有审计行；失败批次、幂等重放、预演不写。
+- 单行表 **`transfer_revision`**（`id=1`，`revision` 初始为 `0`）是全局转移修订号：
+  每个**成功批次**在容器扣减 / `version` 递增 / 审计追加所在的**同一事务**内
+  原子 `+1`（一批多条转移也只加 1）；预演、失败批次与幂等重放不递增。
+  初始样品登记、空容器登记、容量修改与不相容规则替换均不是转移，不触碰修订号。
+  祖先来源反向追踪（`GET /sources/{id}/containers`）的分页游标携带查询时刻的
+  修订号，用于跨页一致性检测。
+- 表 **`components`** 上有两个覆盖索引：
+  **`idx_components_source_container(source_id, container_id, amount)`**
+  支撑祖先来源反向追踪（按 `source_id` 一次有序范围扫描即可取到仍含该来源的
+  容器 ID 与份额，仅索引扫描），配合 `container_id` 键集分页无需 OFFSET；
+  **`idx_components_container_source(container_id, source_id, amount)`**
+  支撑正向容器查询与反向追踪中的容器体积聚合（按容器 `SUM(amount)` 仅索引扫描）。
 
 ---
 
@@ -595,6 +635,94 @@ curl http://localhost:8000/containers/V1
 - `proportion`：占容器当前体积的比例，按 `PROPORTION_SCALE` 四舍五入，仅用于展示。
 - 空容器返回 `"version":0`、`"volume":"0"`、`"sources":[]`；未知容器返回 `404 unknown_container`。
 
+### 8. 祖先来源反向追踪（仍含某初始样品的全部容器）
+
+`GET /sources/{sample_id}/containers` 是容器来源占比查询的**反向**版本：给定一个
+**初始样品**，按当前 `components` 表找出所有**仍含该样品非零份额**的容器（样品自身
+剩余、直接转入的容器、以及经多代混合传播的下游容器都会列出），按 `container_id`
+**字典序**稳定分页返回每个容器的当前体积、该来源的**绝对份额**与**占比**。
+
+```bash
+# 接前文：S1 100 / S2 100 -> V1(40/60) -> V2 取 25（S1=10, S2=15）
+curl 'http://localhost:8000/sources/S1/containers'
+```
+
+```json
+{
+  "sample_id": "S1",
+  "transfer_revision": 1,
+  "min_amount": "0.000000000",
+  "limit": 100,
+  "count": 3,
+  "next_cursor": null,
+  "containers": [
+    {"container_id": "S1", "volume": "60.000000000",
+     "source_amount": "60.000000000", "proportion": "1.000000"},
+    {"container_id": "V1", "volume": "75.000000000",
+     "source_amount": "30.000000000", "proportion": "0.400000"},
+    {"container_id": "V2", "volume": "25.000000000",
+     "source_amount": "10.000000000", "proportion": "0.400000"}
+  ]
+}
+```
+
+- `volume`：容器**当前总体积**（全部祖先份额之和）；
+- `source_amount`：该初始样品在容器中的**绝对体积份额**（精确，可跨容器累加核对
+  守恒：全部持有容器的该字段之和恒等于初始样品体积）；
+- `proportion`：`source_amount / volume`，按 `PROPORTION_SCALE` 四舍五入的展示值；
+- 样品已**完全转空**时其自身不再出现，但持有其份额的下游容器照常返回；
+- `transfer_revision`：查询时刻的全局转移修订号（见“数据模型”）。
+
+查询参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `min_amount` | 可选（数字或字符串，推荐字符串）。只保留 `source_amount >= min_amount` 的容器；非负、小数位受 `DECIMAL_SCALE` 限制，非法返回 `422 invalid_min_amount`；响应回显规范化后的值 |
+| `limit` | 可选，页大小，`1..100`，默认 `100`；越界返回 `422 invalid_limit` |
+| `cursor` | 可选，上一页响应中的 `next_cursor`（不透明字符串）；翻页时不得更换 `min_amount` |
+
+#### 分页与跨页一致性（cursor / transfer_revision）
+
+响应中的 `next_cursor` 为不透明游标（base64 编码的 JSON），携带：游标结构版本、
+**全局 `transfer_revision`**、所属样品 ID、本页最后一个 `container_id`（字典序
+键集分页位置）与 `min_amount`。末页 `next_cursor` 为 `null`。
+
+```bash
+curl 'http://localhost:8000/sources/S1/containers?limit=2'
+# {"count":2,"transfer_revision":1,
+#  "next_cursor":"eyJ2IjoxLCJyZXYiOjEsInNhbXBsZSI6IlMxIiwiYWZ0ZXIiOiJWMSIsIm1pbl9hbW91bnQiOiIwLjAwMDAwMDAwMCJ9",
+#  "containers":[{"container_id":"S1",...},{"container_id":"V1",...}]}
+
+curl 'http://localhost:8000/sources/S1/containers?limit=2&cursor=eyJ2Ij...'
+# {"count":1,"next_cursor":null,"containers":[{"container_id":"V2",...}]}
+```
+
+修订号仅在**成功批次**提交时原子 +1，因此它恰好刻画“组件表内容的版本”：
+
+- 翻页期间有成功批次提交，再用旧游标请求 -> **`409 stale_cursor`**
+  （`details` 含 `cursor_revision` 与 `current_revision`），客户端应丢弃旧游标，
+  从第一页重新开始；
+- 翻页期间只有**预演、失败批次或幂等重放** -> 修订号不变，游标继续有效；
+- 游标损坏 / 无法解码 / 版本不受支持 -> **`400 invalid_cursor`**；
+- 游标属于**另一个样品**、或翻页时改变了 **`min_amount`** ->
+  **`400 cursor_parameter_mismatch`**；
+- 样品 ID 未登记为初始样品（未知 ID，或该 ID 只是个空容器）->
+  **`404 unknown_sample`**。
+
+```json
+{
+  "error": {
+    "code": "stale_cursor",
+    "message": "cursor 基于 transfer_revision=1，当前修订号已变为 2（翻页期间有成功批次提交），请丢弃旧游标后重新查询",
+    "details": {"cursor_revision": 1, "current_revision": 2}
+  }
+}
+```
+
+查询在服务端通过**只读 SQLite 连接**（`mode=ro` + `query_only` 双重保险）与显式
+只读事务执行：整次请求读取同一一致性快照，且物理上无法写入；所有体积 / 份额 /
+比例字段均为 `Decimal` 计算并以**定点字符串**序列化，不经过 `float`。
+
 ---
 
 ## 审计链（只追加 + 哈希链）
@@ -638,7 +766,7 @@ INSERT，不提供修改/删除审计记录的 API。
 > 防写保护；需要更强保证时可定期把 `GET /audit/verify` 与最后一条 `entry_hash`
 > 存放到带外（如离线 WORM / 另一台主机）。
 
-### 8. 查询审计记录：按容器与序号范围
+### 10. 查询审计记录：按容器与序号范围
 
 ```bash
 # 全部记录（按 seq 升序，默认 limit=100，最大 1000）
@@ -703,7 +831,7 @@ curl 'http://localhost:8000/audit/records?start_seq=2&end_seq=10&limit=20'
 }
 ```
 
-### 9. 校验整条审计链
+### 11. 校验整条审计链
 
 ```bash
 curl http://localhost:8000/audit/verify
@@ -785,12 +913,14 @@ pytest -q
 ```
 app/
   config.py     # 环境变量配置
-  db.py         # SQLite 连接、建库（启动时执行，含审计表、规则表与只追加触发器迁移）
+  db.py         # SQLite 连接（含只读连接）、建库（启动时执行，含审计表、规则表、
+                #   transfer_revision、覆盖索引与只追加触发器迁移）
   schemas.py    # Pydantic 请求/响应模型（Decimal <-> 字符串）
-  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、容量/不相容校验、查询
+  service.py    # 核心逻辑：登记、批量转移事务、比例分摊、容量/不相容校验、查询、
+                #   祖先来源反向追踪与游标分页
   audit.py      # 只追加审计链：载荷规范化、哈希、同事务追加、查询、链校验
-  main.py       # FastAPI 路由与错误处理（含 /compatibility/rules、/audit/*）
-tests/          # pytest 端到端、分摊算法、幂等、容量、不相容规则与审计链测试
+  main.py       # FastAPI 路由与错误处理（含 /compatibility/rules、/sources/*、/audit/*）
+tests/          # pytest 端到端、分摊算法、幂等、容量、不相容规则、反向追踪与审计链测试
 Dockerfile
 docker-compose.yml
 docker-entrypoint.sh

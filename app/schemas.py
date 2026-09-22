@@ -190,6 +190,44 @@ class SampleOut(BaseModel):
     volume: DecimalStr
 
 
+# --------------------------------------------------------------------------- #
+# 祖先来源反向追踪（GET /sources/{sample_id}/containers）
+# --------------------------------------------------------------------------- #
+class SourceContainerOut(BaseModel):
+    """一个仍持有指定初始样品非零份额的容器。"""
+
+    container_id: str
+    volume: DecimalStr = Field(..., description="该容器当前总体积（各祖先份额之和）")
+    source_amount: DecimalStr = Field(
+        ..., description="指定来源（初始样品）在该容器中的绝对体积份额"
+    )
+    proportion: DecimalStr = Field(
+        ..., description="source_amount / volume，按 PROPORTION_SCALE 四舍五入"
+    )
+
+
+class SourceContainersOut(BaseModel):
+    sample_id: str
+    transfer_revision: int = Field(
+        ...,
+        description=(
+            "全局转移修订号：每个成功批次在其写事务内原子 +1，"
+            "预演 / 失败 / 幂等重放不递增。游标携带该值，翻页期间变化返回 409 stale_cursor"
+        ),
+    )
+    min_amount: DecimalStr = Field(
+        ..., description="本次过滤阈值（未提供参数时为 0），已按 DECIMAL_SCALE 规范化"
+    )
+    limit: int
+    count: int = Field(..., description="本页实际返回的容器数")
+    next_cursor: str | None = Field(
+        ..., description="下一页游标；无更多结果时为 null"
+    )
+    containers: list[SourceContainerOut] = Field(
+        ..., description="仍含该初始样品非零份额的容器，按 container_id 字典序分页"
+    )
+
+
 class ContainerOut(BaseModel):
     container_id: str
 

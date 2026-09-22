@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import sqlite3
 from contextlib import contextmanager
 from typing import Iterator
@@ -35,7 +36,26 @@ CREATE TABLE IF NOT EXISTS components (
     PRIMARY KEY (container_id, source_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_components_source ON components(source_id);
+-- 反向追踪“哪些容器仍含某初始样品”的覆盖索引：按 source_id 一次范围
+-- 扫描即可有序拿到 (container_id, amount)，无需回表（GET /sources/{id}/containers）。
+CREATE INDEX IF NOT EXISTS idx_components_source_container
+    ON components(source_id, container_id, amount);
+
+-- 正向“容器体积 / 来源构成”查询的覆盖索引：按 container_id 点查 / SUM(amount)
+-- 走仅索引扫描，无需回表（GET /containers/{id} 与反向追踪的体积聚合）。
+CREATE INDEX IF NOT EXISTS idx_components_container_source
+    ON components(container_id, source_id, amount);
+
+-- 全局转移修订号（单行，id 恒为 1）：每个成功提交的批次在其写事务内
+-- 原子 +1；预演、失败批次与幂等重放不递增。祖先来源反向追踪的分页游标
+-- 携带查询时刻的修订号，翻页期间号变化即判定游标过期（409 stale_cursor）。
+CREATE TABLE IF NOT EXISTS transfer_revision (
+    id       INTEGER PRIMARY KEY CHECK (id = 1),
+    revision INTEGER NOT NULL DEFAULT 0
+);
+
+-- 旧库升级时补出唯一一行（修订号从 0 起，历史批次不追溯计数）
+INSERT OR IGNORE INTO transfer_revision (id, revision) VALUES (1, 0);
 
 -- POST /transfers/batch 的幂等记录：仅在批次成功提交时，与容器扣减/版本递增
 -- 写入同一个事务。重放（同键同请求体）直接返回 response_body，不再扣减体积。
@@ -66,10 +86,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """对已有数据库做幂等升级（旧库没有 containers.version / capacity /
     is_sample 列）。
 
-    ``idempotency_keys``、``compatibility_rules`` 与审计链相关的表
-    （``audit_records``、``audit_record_containers``）由建表脚本中的
-    ``CREATE TABLE IF NOT EXISTS`` 负责补齐，旧库升级时自动创建，无需手工
-    迁移；只追加审计触发器在此幂等安装。
+    ``idempotency_keys``、``compatibility_rules``、``transfer_revision``
+    与审计链相关的表（``audit_records``、``audit_record_containers``）由
+    建表脚本中的 ``CREATE TABLE IF NOT EXISTS`` 负责补齐，旧库升级时自动
+    创建，无需手工迁移；只追加审计触发器在此幂等安装。
+
+    旧库 ``components`` 上的单列索引 ``idx_components_source`` 由建表脚本
+    换成两个覆盖索引（``idx_components_source_container`` 支撑按来源反向
+    追踪、``idx_components_container_source`` 支撑按容器聚合体积，均为仅
+    索引扫描），此处幂等摘除旧索引。
     """
     columns = {row["name"] for row in conn.execute("PRAGMA table_info(containers)")}
     if columns and "version" not in columns:
@@ -93,6 +118,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         )
     # 审计表的只追加触发器（BEFORE UPDATE/DELETE -> RAISE），已存在则跳过
     install_audit_triggers(conn)
+    # 旧的单列索引已被建表脚本中的覆盖索引取代（执行一次后为无操作的幂等 DDL）
+    conn.execute("DROP INDEX IF EXISTS idx_components_source")
 
 
 def connect() -> sqlite3.Connection:
@@ -131,7 +158,48 @@ def get_conn_context() -> Iterator[sqlite3.Connection]:
         conn.close()
 
 
+def connect_readonly() -> sqlite3.Connection:
+    """以**只读**模式打开一个 SQLite 连接（``mode=ro`` URI）。
+
+    SQLite 层直接拒绝任何写操作（INSERT/UPDATE/DELETE/DDL 抛
+    ``attempt to write a readonly database``）；配合显式
+    ``BEGIN`` / ``ROLLBACK``，查询期间读取的是事务开始时刻的一致性快照，
+    翻页过程中其他连接提交的批次不会影响本次读取。供只读查询依赖使用。
+
+    要求库文件已由 :func:`init_db` 初始化（容器启动 / 测试夹具均保证）。
+    WAL 模式下只读连接无需写共享内存（3.22+），目录只读也能正常查询。
+    """
+    uri = pathlib.Path(os.path.abspath(settings.database_path)).as_uri()
+    conn = sqlite3.connect(
+        f"{uri}?mode=ro",
+        uri=True,
+        detect_types=sqlite3.PARSE_DECLTYPES,
+        isolation_level=None,  # 显式事务
+    )
+    conn.row_factory = sqlite3.Row
+    # query_only 作为应用侧第二重只读保险（mode=ro 已在 SQLite 层拦截写入）
+    conn.execute("PRAGMA query_only = ON")
+    conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA busy_timeout=5000")
+    return conn
+
+
+@contextmanager
+def get_readonly_conn_context() -> Iterator[sqlite3.Connection]:
+    conn = connect_readonly()
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def get_db() -> Iterator[sqlite3.Connection]:
-    """FastAPI 请求依赖。"""
+    """FastAPI 请求依赖（读写连接）。"""
     with get_conn_context() as conn:
+        yield conn
+
+
+def get_db_readonly() -> Iterator[sqlite3.Connection]:
+    """FastAPI 请求依赖（只读连接）。"""
+    with get_readonly_conn_context() as conn:
         yield conn

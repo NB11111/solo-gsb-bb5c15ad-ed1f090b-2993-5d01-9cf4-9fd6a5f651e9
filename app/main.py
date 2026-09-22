@@ -4,12 +4,14 @@ from __future__ import annotations
 import json
 import sqlite3
 from contextlib import asynccontextmanager
+from decimal import Decimal
 
-from fastapi import Depends, FastAPI, Request, Response
+from fastapi import Depends, FastAPI, Query, Request, Response
 from fastapi.responses import JSONResponse
 
 from . import audit, service
-from .db import get_db, init_db
+from .config import settings
+from .db import get_db, get_db_readonly, init_db
 from .schemas import (
     AuditListOut,
     AuditVerifyOut,
@@ -24,6 +26,7 @@ from .schemas import (
     ContainerStatusOut,
     SampleIn,
     SampleOut,
+    SourceContainersOut,
 )
 
 
@@ -53,8 +56,14 @@ app = FastAPI(
         "每个成功批次在同一事务追加一条只追加审计记录（含批次摘要、受影响容器、"
         "结果版本），以前一条记录的哈希形成可校验哈希链；"
         "失败 / 重放 / 预演均不产生审计记录。"
+        "GET /sources/{sample_id}/containers 提供祖先来源反向追踪：按当前组件表"
+        "找出所有仍含该初始样品非零份额的容器（容器体积、该来源绝对份额与占比），"
+        "支持 min_amount 过滤与 limit / 不透明 cursor 稳定分页（按 container_id "
+        "字典序）。游标携带全局 transfer_revision——仅成功批次在其写事务内原子 +1"
+        "（预演、失败、幂等重放不递增），翻页期间修订号变化返回 409 stale_cursor；"
+        "查询在只读事务中执行，序列化全程使用 Decimal 字符串。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -212,6 +221,60 @@ def container_status(
     container_id: str, conn: sqlite3.Connection = Depends(get_db)
 ) -> dict:
     return service.get_container_status(conn, container_id)
+
+
+@app.get(
+    "/sources/{sample_id}/containers",
+    response_model=SourceContainersOut,
+    tags=["query"],
+    summary="祖先来源反向追踪：查询仍含某初始样品非零份额的全部容器（游标分页）",
+)
+def source_containers(
+    sample_id: str,
+    min_amount: str | None = Query(
+        default=None,
+        description=(
+            "只保留该来源绝对份额 >= min_amount 的容器；非负、小数位受 "
+            "DECIMAL_SCALE 限制，非法返回 422 invalid_min_amount"
+        ),
+    ),
+    limit: int = Query(
+        default=service.SOURCE_DEFAULT_LIMIT,
+        description=(
+            f"页大小，1..{service.SOURCE_MAX_LIMIT}，默认 "
+            f"{service.SOURCE_DEFAULT_LIMIT}，越界返回 422 invalid_limit"
+        ),
+    ),
+    cursor: str | None = Query(
+        default=None,
+        description=(
+            "上一页响应中的 next_cursor；翻页时不得更换 min_amount，"
+            "游标损坏 400 invalid_cursor、参数不一致 400 cursor_parameter_mismatch、"
+            "修订号变化 409 stale_cursor"
+        ),
+    ),
+    conn: sqlite3.Connection = Depends(get_db_readonly),
+) -> dict:
+    # min_amount 以字符串接收，交由 service 用 Decimal 解析，保证非法值
+    # （非数字 / 负数 / 非有限数 / 超精度）统一走业务错误信封
+    min_amount_decimal: Decimal | None = None
+    if min_amount is not None:
+        try:
+            min_amount_decimal = Decimal(min_amount)
+        except Exception:
+            raise service.LineageError(
+                422,
+                "invalid_min_amount",
+                "min_amount 必须是非负有限数，且小数位不能超过"
+                f" {settings.decimal_scale} 位",
+            )
+    return service.list_source_containers(
+        conn,
+        sample_id,
+        min_amount=min_amount_decimal,
+        limit=limit,
+        cursor=cursor,
+    )
 
 
 # --------------------------------------------------------------------------- #
